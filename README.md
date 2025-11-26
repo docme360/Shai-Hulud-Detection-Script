@@ -97,6 +97,22 @@ uv run python main.py --repo owner/repo --malicious-list-url https://example.com
 
 For scanning repositories with many branches/PRs, using a GitHub token is strongly recommended.
 
+## GitHub Personal Access Token
+To run the script against private repos, you need to create a Github Personal Access Token in order to access.  
+To create the token: 
+1. Go to your github page and click on your avatar.
+2. Click on Settings
+3. At the bottom of the left sidebar, click on `Developer settings`
+4. At the bottom of the left sidebar, click on `Personal access tokens` -> `Tokens (classic)`
+5. Click on `Generate new token(classic)`
+6. Give token a name and in the `Select scopes` section, select the checkbox next to `repo` to get full control of private repositories.
+7. Click on `Generate token`
+8. Copy the token. **Note** - This will not be shown again so copy it and save it to a safe place.
+
+Run the script with the copied token.  
+
+**Note** - When you are done checking your repos, it would be good to delete the token from Github.  
+
 ## Contributing
 
 Contributions are welcome! If you discover additional malicious packages or have improvements to the detection logic, please open an issue or submit a pull request.
