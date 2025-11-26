@@ -4,7 +4,7 @@ A Python-based security tool to scan GitHub repositories for npm packages compro
 
 ## Overview
 
-The Shai-Hulud campaign is a supply chain attack targeting the JavaScript/Node.js ecosystem through malicious npm packages. This tool helps developers and security teams audit their projects to identify potentially compromised dependencies by checking against the [Wiz Security IOC list]([https://github.com/wiz-sec-public/wiz-research-iocs](https://github.com/wiz-sec-public/wiz-research-iocs/blob/main/reports/shai-hulud-2-packages.csv)).
+The Shai-Hulud campaign is a supply chain attack targeting the JavaScript/Node.js ecosystem through malicious npm packages. This tool helps developers and security teams audit their projects to identify potentially compromised dependencies by checking against the [Wiz Security IOC list]([https://raw.githubusercontent.com/wiz-sec-public/wiz-research-iocs/refs/heads/main/reports/shai-hulud-2-packages.csv]).
 
 ## Features
 
