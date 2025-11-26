@@ -388,6 +388,74 @@ def parse_package_json(content: str) -> dict[str, str]:
     return packages
 
 
+def parse_affected_versions(version_string: str) -> set[str]:
+    """
+    Parse affected version strings from the IOC CSV.
+    
+    Formats supported:
+    - "= 1.2.3" -> {"1.2.3"}
+    - "= 1.2.3 || = 1.2.4" -> {"1.2.3", "1.2.4"}
+    - "1.2.3" -> {"1.2.3"}
+    
+    Returns:
+        set: Set of affected version strings
+    """
+    versions = set()
+    
+    # Split by "||" for multiple versions
+    parts = version_string.split("||")
+    
+    for part in parts:
+        part = part.strip()
+        # Remove leading "=" or "= " if present
+        if part.startswith("="):
+            part = part[1:].strip()
+        if part:
+            versions.add(part)
+    
+    return versions
+
+
+def normalize_version(version: str) -> str:
+    """
+    Normalize a version string by removing range specifiers.
+    
+    Examples:
+    - "^1.2.3" -> "1.2.3"
+    - "~1.2.3" -> "1.2.3"
+    - ">=1.2.3" -> "1.2.3"
+    - "1.2.3" -> "1.2.3"
+    
+    Returns:
+        str: Normalized version string
+    """
+    # Remove common range specifiers
+    version = version.strip()
+    for prefix in ['^', '~', '>=', '<=', '>', '<', '=']:
+        if version.startswith(prefix):
+            version = version[len(prefix):]
+    return version.strip()
+
+
+def is_version_affected(installed_version: str, affected_version_string: str) -> bool:
+    """
+    Check if an installed version matches any of the affected versions.
+    
+    Args:
+        installed_version: The version that's installed (e.g., "4.18.0" or "^4.18.0")
+        affected_version_string: The affected versions string (e.g., "= 5.13.3 || = 4.18.1")
+    
+    Returns:
+        bool: True if the installed version is in the affected versions
+    """
+    affected_versions = parse_affected_versions(affected_version_string)
+    
+    # Normalize the installed version (remove ^, ~, etc.)
+    normalized_installed = normalize_version(installed_version)
+    
+    return normalized_installed in affected_versions
+
+
 # --- Malicious Package List ---
 
 def fetch_affected_packages(
@@ -518,16 +586,19 @@ class RepoScanner:
                 # Check for malicious packages
                 for pkg_name, installed_version in packages.items():
                     if pkg_name in self.affected_packages:
-                        affected_version = self.affected_packages[pkg_name]
-                        results.append(ScanResult(
-                            ref_name=ref.name,
-                            ref_type=ref.ref_type,
-                            package_name=pkg_name,
-                            installed_version=installed_version,
-                            affected_version=affected_version,
-                            lock_file=file_path,
-                            is_exact_version=is_exact
-                        ))
+                        affected_version_string = self.affected_packages[pkg_name]
+                        
+                        # Actually check if the installed version matches an affected version
+                        if is_version_affected(installed_version, affected_version_string):
+                            results.append(ScanResult(
+                                ref_name=ref.name,
+                                ref_type=ref.ref_type,
+                                package_name=pkg_name,
+                                installed_version=installed_version,
+                                affected_version=affected_version_string,
+                                lock_file=file_path,
+                                is_exact_version=is_exact
+                            ))
         
         return results
     
