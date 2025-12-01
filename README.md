@@ -1,6 +1,6 @@
 # Shai-Hulud Detection Script
 
-A Python-based security tool to scan GitHub repositories for npm packages compromised by the Shai-Hulud worm malware campaign.
+A Python-based security tool to scan GitHub repositories for npm packages compromised by the Shai-Hulud worm malware campaign, plus security hygiene checks to help protect against future attacks.
 
 ## Overview
 
@@ -8,6 +8,7 @@ The Shai-Hulud campaign is a supply chain attack targeting the JavaScript/Node.j
 
 ## Features
 
+### Malware Detection
 - Scan GitHub repositories (all branches and open PRs)
 - Scan multiple local git repositories in a directory
 - Support for multiple lock file formats:
@@ -15,7 +16,16 @@ The Shai-Hulud campaign is a supply chain attack targeting the JavaScript/Node.j
   - `yarn.lock` (Yarn v1)
   - `pnpm-lock.yaml` (pnpm v6+)
   - `package.json` (fallback for version ranges)
-- JSON export for CI/CD integration
+
+### Security Hygiene Checks (Always Enabled)
+- **Non-pinned dependencies**: Detects version ranges (`^`, `~`, `>=`), wildcards (`*`, `latest`), and git URLs without commit hashes
+- **Missing lock files**: Alerts when `package.json` exists without a corresponding lock file
+- **Lockfile injection detection**: Identifies suspicious resolved URLs pointing to untrusted hosts or using HTTP
+- **Dependency bot analysis**: Detects Dependabot/Renovate configs and warns about auto-merge risks
+
+### Output
+- JSON export for CI/CD integration (includes both malware findings and security warnings)
+- General security recommendations printed at end of scan
 - Zero external dependencies (uses only Python stdlib)
 
 ## Requirements
@@ -69,17 +79,8 @@ uv run python main.py --repo owner/repo --output results.json
 
 # Verbose/debug mode
 uv run python main.py --repo owner/repo --verbose
-
-# Just list dependency files found (no malware check)
-uv run python main.py --repo owner/repo --list-lock-files
 ```
 
-### Custom Malicious Package List
-
-```bash
-# Use a custom CSV of malicious packages
-uv run python main.py --repo owner/repo --malicious-list-url https://example.com/packages.csv
-```
 
 ## How It Works
 
@@ -88,7 +89,23 @@ uv run python main.py --repo owner/repo --malicious-list-url https://example.com
 3. For each ref, locates dependency lock files (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`)
 4. Parses lock files to extract exact package versions
 5. Compares installed packages against the malicious package list
-6. Reports any matches with details about the affected ref and lock file
+6. Performs security hygiene checks:
+   - Checks for unpinned dependencies in package.json
+   - Verifies lock files exist for each package.json
+   - Scans lockfiles for suspicious resolved URLs
+   - Detects Dependabot/Renovate configurations
+7. Reports findings and provides security recommendations
+
+## Security Recommendations
+
+The tool provides actionable security guidance based on [Snyk's npm security best practices](https://snyk.io/articles/npm-security-best-practices-shai-hulud-attack/):
+
+1. **Use deterministic installs**: `npm ci`, `yarn --frozen-lockfile`, `pnpm --frozen-lockfile`
+2. **Disable postinstall scripts**: `npm ci --ignore-scripts`
+3. **Avoid blind dependency upgrades**: Never run `npm update` or `npx npm-check-updates -u`
+4. **Validate lockfiles**: Use `lockfile-lint` to detect injection attacks
+5. **Use version cooldown**: Avoid brand-new package versions with pnpm's `minimumReleaseAge`
+6. **Use dev containers**: Sandbox development to limit blast radius
 
 ## GitHub API Rate Limits
 
@@ -98,8 +115,10 @@ uv run python main.py --repo owner/repo --malicious-list-url https://example.com
 For scanning repositories with many branches/PRs, using a GitHub token is strongly recommended.
 
 ## GitHub Personal Access Token
-To run the script against private repos, you need to create a Github Personal Access Token in order to access.  
-To create the token: 
+
+To run the script against private repos, you need to create a Github Personal Access Token in order to access.
+
+To create the token:
 1. Go to your github page and click on your avatar.
 2. Click on Settings
 3. At the bottom of the left sidebar, click on `Developer settings`
@@ -109,9 +128,9 @@ To create the token:
 7. Click on `Generate token`
 8. Copy the token. **Note** - This will not be shown again so copy it and save it to a safe place.
 
-Run the script with the copied token.  
+Run the script with the copied token.
 
-**Note** - When you are done checking your repos, it would be good to delete the token from Github.  
+**Note** - When you are done checking your repos, it would be good to delete the token from Github.
 
 ## Contributing
 

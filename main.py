@@ -44,6 +44,17 @@ class RefInfo:
     pr_number: Optional[int] = None
 
 
+@dataclass
+class SecurityWarning:
+    """Represents a security hygiene warning."""
+    warning_type: str  # 'unpinned_dependency', 'missing_lock_file', 'lockfile_injection', 'dependency_bot'
+    severity: str  # 'high', 'medium', 'low', 'info'
+    file_path: str
+    message: str
+    package_name: Optional[str] = None
+    details: Optional[str] = None
+
+
 # --- GitHub API ---
 
 class GitHubAPI:
@@ -456,6 +467,335 @@ def is_version_affected(installed_version: str, affected_version_string: str) ->
     return normalized_installed in affected_versions
 
 
+# --- Security Hygiene Checks ---
+
+def check_unpinned_dependencies(content: str, file_path: str) -> list[SecurityWarning]:
+    """
+    Check package.json for non-pinned dependencies.
+
+    Detects:
+    - Version ranges using ^, ~, >=, >, <, <=
+    - Wildcard versions: *, x, latest
+    - Git URLs without commit hashes
+    - npm tags (e.g., next, beta, canary)
+
+    Returns:
+        list of SecurityWarning objects
+    """
+    warnings = []
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return warnings
+
+    dep_keys = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']
+
+    # Common npm tags that aren't pinned versions
+    npm_tags = {'latest', 'next', 'beta', 'alpha', 'canary', 'rc', 'experimental'}
+
+    for key in dep_keys:
+        deps = data.get(key, {})
+        if not isinstance(deps, dict):
+            continue
+
+        for name, version in deps.items():
+            if not isinstance(version, str):
+                continue
+
+            version = version.strip()
+            reason = None
+
+            # Check for range specifiers
+            if version.startswith('^'):
+                reason = "uses ^ range (allows minor updates)"
+            elif version.startswith('~'):
+                reason = "uses ~ range (allows patch updates)"
+            elif version.startswith('>=') or version.startswith('>'):
+                reason = "uses >= or > range"
+            elif version.startswith('<=') or version.startswith('<'):
+                reason = "uses <= or < range"
+            # Check for wildcards
+            elif version in ('*', 'x', 'X'):
+                reason = "uses wildcard (any version)"
+            elif '.x' in version or '.X' in version or '.*' in version:
+                reason = "uses partial wildcard"
+            # Check for npm tags
+            elif version.lower() in npm_tags:
+                reason = f"uses npm tag '{version}'"
+            # Check for git URLs without pinned commit
+            elif version.startswith('git://') or version.startswith('git+'):
+                if '#' not in version:
+                    reason = "git URL without pinned commit hash"
+            elif version.startswith('github:') or '/' in version and not version[0].isdigit():
+                if '#' not in version:
+                    reason = "GitHub shorthand without pinned commit"
+            # Check for URL-based dependencies
+            elif version.startswith('http://') or version.startswith('https://'):
+                if '#' not in version and not version.endswith('.tgz'):
+                    reason = "URL dependency without pinned version"
+            # Check for version ranges with ||
+            elif '||' in version:
+                reason = "uses version range with || (multiple ranges)"
+            # Check for space-separated ranges (e.g., ">=1.0.0 <2.0.0")
+            elif ' ' in version and any(c in version for c in ['^', '~', '>', '<', '=']):
+                reason = "uses compound version range"
+
+            if reason:
+                warnings.append(SecurityWarning(
+                    warning_type='unpinned_dependency',
+                    severity='high',
+                    file_path=file_path,
+                    message=f"{name}: {version} ({reason})",
+                    package_name=name,
+                    details=f"Pin to exact version to prevent unexpected updates"
+                ))
+
+    return warnings
+
+
+def check_missing_lock_files(dep_files: list[str]) -> list[SecurityWarning]:
+    """
+    Check for package.json files without corresponding lock files.
+
+    Args:
+        dep_files: List of dependency file paths found in the repo
+
+    Returns:
+        list of SecurityWarning objects for missing lock files
+    """
+    warnings = []
+
+    # Group files by directory
+    dirs_with_package_json = set()
+    dirs_with_lock_file = set()
+
+    for file_path in dep_files:
+        # Get directory (or empty string for root)
+        if '/' in file_path:
+            dir_path = file_path.rsplit('/', 1)[0]
+        else:
+            dir_path = ''
+
+        if file_path.endswith('package.json'):
+            dirs_with_package_json.add((dir_path, file_path))
+        elif file_path.endswith(('package-lock.json', 'yarn.lock', 'pnpm-lock.yaml')):
+            dirs_with_lock_file.add(dir_path)
+
+    # Find package.json files without lock files in the same directory
+    for dir_path, package_json_path in dirs_with_package_json:
+        if dir_path not in dirs_with_lock_file:
+            warnings.append(SecurityWarning(
+                warning_type='missing_lock_file',
+                severity='high',
+                file_path=package_json_path,
+                message=f"{package_json_path} has no lock file",
+                details="Generate and commit a lock file:\n"
+                        "  npm:  npm install -> creates package-lock.json\n"
+                        "  yarn: yarn install -> creates yarn.lock\n"
+                        "  pnpm: pnpm install -> creates pnpm-lock.yaml"
+            ))
+
+    return warnings
+
+
+def check_lockfile_injection(content: str, file_path: str, file_type: str) -> list[SecurityWarning]:
+    """
+    Check lockfile for suspicious resolved URLs that may indicate lockfile injection.
+
+    Detects:
+    - Resolved URLs pointing to non-standard hosts (not npm, yarn, github)
+    - HTTP URLs (should be HTTPS)
+    - Tarball URLs to arbitrary hosts
+
+    Args:
+        content: The lockfile content
+        file_path: Path to the lockfile
+        file_type: Type of lockfile ('package-lock.json', 'yarn.lock', 'pnpm-lock.yaml')
+
+    Returns:
+        list of SecurityWarning objects
+    """
+    warnings = []
+
+    # Trusted hosts for package resolution
+    trusted_hosts = [
+        'registry.npmjs.org',
+        'registry.yarnpkg.com',
+        'npm.pkg.github.com',
+        'registry.npmmirror.com',
+        'github.com',
+        'raw.githubusercontent.com',
+    ]
+
+    def is_trusted_url(url: str) -> bool:
+        """Check if URL is from a trusted host."""
+        url_lower = url.lower()
+        # Check for HTTP (not HTTPS) - always suspicious
+        if url_lower.startswith('http://'):
+            return False
+        for host in trusted_hosts:
+            if host in url_lower:
+                return True
+        return False
+
+    if file_type == 'package-lock.json':
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return warnings
+
+        # Check packages in lockfileVersion 2/3 format
+        packages = data.get('packages', {})
+        for pkg_path, pkg_info in packages.items():
+            if not pkg_path:  # Skip root
+                continue
+            resolved = pkg_info.get('resolved', '')
+            if resolved and not is_trusted_url(resolved):
+                pkg_name = pkg_path.split('node_modules/')[-1] if 'node_modules/' in pkg_path else pkg_path
+                reason = "HTTP URL (not HTTPS)" if resolved.startswith('http://') else "untrusted host"
+                warnings.append(SecurityWarning(
+                    warning_type='lockfile_injection',
+                    severity='high',
+                    file_path=file_path,
+                    message=f"{pkg_name}: resolves to {reason}",
+                    package_name=pkg_name,
+                    details=f"Resolved URL: {resolved[:100]}..."
+                ))
+
+        # Also check legacy dependencies format
+        def check_deps(deps: dict, prefix: str = ""):
+            for name, info in deps.items():
+                if isinstance(info, dict):
+                    resolved = info.get('resolved', '')
+                    if resolved and not is_trusted_url(resolved):
+                        reason = "HTTP URL (not HTTPS)" if resolved.startswith('http://') else "untrusted host"
+                        warnings.append(SecurityWarning(
+                            warning_type='lockfile_injection',
+                            severity='high',
+                            file_path=file_path,
+                            message=f"{name}: resolves to {reason}",
+                            package_name=name,
+                            details=f"Resolved URL: {resolved[:100]}..."
+                        ))
+                    if 'dependencies' in info:
+                        check_deps(info['dependencies'], f"{prefix}{name}/")
+
+        if 'dependencies' in data:
+            check_deps(data['dependencies'])
+
+    elif file_type == 'yarn.lock':
+        # Simple pattern matching for yarn.lock resolved URLs
+        resolved_pattern = re.compile(r'^\s+resolved\s+"([^"]+)"', re.MULTILINE)
+        for match in resolved_pattern.finditer(content):
+            url = match.group(1)
+            if not is_trusted_url(url):
+                reason = "HTTP URL (not HTTPS)" if url.startswith('http://') else "untrusted host"
+                warnings.append(SecurityWarning(
+                    warning_type='lockfile_injection',
+                    severity='high',
+                    file_path=file_path,
+                    message=f"Suspicious resolved URL ({reason})",
+                    details=f"URL: {url[:100]}..."
+                ))
+
+    elif file_type == 'pnpm-lock.yaml':
+        # Check for tarball URLs in pnpm lockfile
+        # pnpm uses a different format, look for resolution URLs
+        tarball_pattern = re.compile(r'tarball:\s*[\'"]?([^\s\'"]+)', re.MULTILINE)
+        for match in tarball_pattern.finditer(content):
+            url = match.group(1)
+            if not is_trusted_url(url):
+                reason = "HTTP URL (not HTTPS)" if url.startswith('http://') else "untrusted host"
+                warnings.append(SecurityWarning(
+                    warning_type='lockfile_injection',
+                    severity='high',
+                    file_path=file_path,
+                    message=f"Suspicious tarball URL ({reason})",
+                    details=f"URL: {url[:100]}..."
+                ))
+
+    return warnings
+
+
+def find_dependency_bot_configs(tree: list[dict]) -> list[str]:
+    """
+    Find Dependabot and Renovate configuration files in the repo tree.
+
+    Args:
+        tree: List of file entries from GitHub API
+
+    Returns:
+        List of config file paths found
+    """
+    config_files = []
+    bot_config_names = [
+        '.github/dependabot.yml',
+        '.github/dependabot.yaml',
+        'renovate.json',
+        'renovate.json5',
+        '.renovaterc',
+        '.renovaterc.json',
+    ]
+
+    for item in tree:
+        if item.get('type') == 'blob':
+            path = item.get('path', '')
+            if path in bot_config_names:
+                config_files.append(path)
+
+    return config_files
+
+
+def analyze_dependency_bot_config(content: str, config_path: str) -> list[SecurityWarning]:
+    """
+    Analyze dependency bot config for potentially risky settings.
+
+    Args:
+        content: The config file content
+        config_path: Path to the config file
+
+    Returns:
+        list of SecurityWarning objects
+    """
+    warnings = []
+
+    # Always warn about presence of dependency bot config
+    if 'dependabot' in config_path.lower():
+        bot_type = 'Dependabot'
+    else:
+        bot_type = 'Renovate'
+
+    warnings.append(SecurityWarning(
+        warning_type='dependency_bot',
+        severity='info',
+        file_path=config_path,
+        message=f"{bot_type} configuration detected",
+        details="Ensure only security updates are auto-merged, not all dependency updates"
+    ))
+
+    # Try to detect risky auto-merge settings
+    try:
+        if config_path.endswith(('.json', '.json5')):
+            # Remove comments for json5
+            clean_content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+            clean_content = re.sub(r'/\*.*?\*/', '', clean_content, flags=re.DOTALL)
+            data = json.loads(clean_content)
+
+            # Check Renovate automerge settings
+            if data.get('automerge') is True:
+                warnings.append(SecurityWarning(
+                    warning_type='dependency_bot',
+                    severity='medium',
+                    file_path=config_path,
+                    message="Renovate automerge is enabled globally",
+                    details="Consider only enabling automerge for security updates or lockfile maintenance"
+                ))
+    except (json.JSONDecodeError, KeyError):
+        pass  # Can't parse, just use the basic warning
+
+    return warnings
+
+
 # --- Malicious Package List ---
 
 def fetch_affected_packages(
@@ -532,28 +872,32 @@ class RepoScanner:
         
         return True
     
-    def scan_ref(self, ref: RefInfo, show_progress: bool = True) -> list[ScanResult]:
-        """Scan a single ref (branch or PR) for malicious packages."""
+    def scan_ref(self, ref: RefInfo, show_progress: bool = True) -> tuple[list[ScanResult], list[SecurityWarning]]:
+        """Scan a single ref (branch or PR) for malicious packages and security issues."""
         results = []
-        
+        warnings = []
+
         # Find all dependency files in this ref
         dep_files = self.api.find_dependency_files(self.owner, self.repo, ref.sha)
-        
+
         if not dep_files:
             if show_progress:
                 print("(no dependency files)")
-            return results
-        
+            return results, warnings
+
+        # Check for missing lock files
+        warnings.extend(check_missing_lock_files(dep_files))
+
         # Separate lock files from package.json files
         lock_files = [f for f in dep_files if not f.endswith('package.json')]
         package_jsons = [f for f in dep_files if f.endswith('package.json')]
-        
+
         # Always scan both lock files AND package.json files
         # This catches:
         # - Actually installed malicious packages (from lock files)
         # - Declared but not-yet-installed malicious packages (from package.json)
         files_to_scan = lock_files + package_jsons
-        
+
         if show_progress:
             lock_count = len(lock_files)
             pj_count = len(package_jsons)
@@ -563,31 +907,35 @@ class RepoScanner:
             if pj_count:
                 parts.append(f"{pj_count} package.json")
             print(f"({', '.join(parts)})...", end=" ")
-        
+
         for file_path in files_to_scan:
             # Determine parser and if it's exact version
             is_exact = True
+            file_type = None
             if file_path.endswith("package-lock.json"):
                 parser = parse_package_lock_json
+                file_type = 'package-lock.json'
             elif file_path.endswith("yarn.lock"):
                 parser = parse_yarn_lock
+                file_type = 'yarn.lock'
             elif file_path.endswith("pnpm-lock.yaml"):
                 parser = parse_pnpm_lock
+                file_type = 'pnpm-lock.yaml'
             elif file_path.endswith("package.json"):
                 parser = parse_package_json
                 is_exact = False
             else:
                 continue
-            
+
             content = self.api.get_file_content(self.owner, self.repo, file_path, ref.sha)
             if content:
                 packages = parser(content)
-                
+
                 # Check for malicious packages
                 for pkg_name, installed_version in packages.items():
                     if pkg_name in self.affected_packages:
                         affected_version_string = self.affected_packages[pkg_name]
-                        
+
                         # Actually check if the installed version matches an affected version
                         if is_version_affected(installed_version, affected_version_string):
                             results.append(ScanResult(
@@ -599,37 +947,46 @@ class RepoScanner:
                                 lock_file=file_path,
                                 is_exact_version=is_exact
                             ))
-        
-        return results
+
+                # Security hygiene checks
+                if file_path.endswith("package.json"):
+                    # Check for unpinned dependencies
+                    warnings.extend(check_unpinned_dependencies(content, file_path))
+                elif file_type:
+                    # Check lockfiles for injection attacks
+                    warnings.extend(check_lockfile_injection(content, file_path, file_type))
+
+        return results, warnings
     
-    def scan_all(self, include_branches: bool = True, include_prs: bool = True) -> list[ScanResult]:
+    def scan_all(self, include_branches: bool = True, include_prs: bool = True) -> tuple[list[ScanResult], list[SecurityWarning]]:
         """Scan all branches and/or PRs in the repository."""
         all_results = []
+        all_warnings = []
         refs_to_scan = []
-        
+
         if include_branches:
             print(f"Fetching branches for {self.owner}/{self.repo}...")
             branches = self.api.get_branches(self.owner, self.repo)
             print(f"  Found {len(branches)} branches")
             refs_to_scan.extend(branches)
-        
+
         if include_prs:
             print(f"Fetching open PRs for {self.owner}/{self.repo}...")
             prs = self.api.get_open_prs(self.owner, self.repo)
             print(f"  Found {len(prs)} open PRs")
             refs_to_scan.extend(prs)
-        
+
         if not refs_to_scan:
             print("No refs to scan.")
-            return all_results
-        
+            return all_results, all_warnings
+
         # Show what dependency files exist on the first ref (usually main/default branch)
         print(f"\nDiscovering dependency files on {refs_to_scan[0].name}...")
         sample_files = self.api.find_dependency_files(self.owner, self.repo, refs_to_scan[0].sha)
         if sample_files:
             lock_files = [f for f in sample_files if not f.endswith('package.json')]
             package_jsons = [f for f in sample_files if f.endswith('package.json')]
-            
+
             if lock_files:
                 print(f"  Lock files ({len(lock_files)}):")
                 for lf in sorted(lock_files):
@@ -640,19 +997,38 @@ class RepoScanner:
                     print(f"    📦 {pj}")
         else:
             print("  ⚠️  No dependency files found on default branch")
-        
+
+        # Check for dependency bot configs on the default branch
+        tree = self.api.get_repo_tree(self.owner, self.repo, refs_to_scan[0].sha)
+        bot_configs = find_dependency_bot_configs(tree)
+        for config_path in bot_configs:
+            content = self.api.get_file_content(self.owner, self.repo, config_path, refs_to_scan[0].sha)
+            if content:
+                all_warnings.extend(analyze_dependency_bot_config(content, config_path))
+
         print(f"\nScanning {len(refs_to_scan)} refs...")
-        
+
+        # We only need to scan the default branch for security warnings (they're repo-wide)
+        # But we scan all refs for malicious packages
+        seen_warnings = set()  # Deduplicate warnings by (type, file_path, message)
+
         for i, ref in enumerate(refs_to_scan, 1):
             print(f"  [{i}/{len(refs_to_scan)}] {ref.ref_type}: {ref.name[:50]}... ", end="")
-            results = self.scan_ref(ref, show_progress=True)
+            results, warnings = self.scan_ref(ref, show_progress=True)
             if results:
                 print(f"⚠️  {len(results)} match(es)!")
             else:
                 print("✓ clean")
             all_results.extend(results)
-        
-        return all_results
+
+            # Only add unique warnings (avoid duplicates from multiple refs)
+            for w in warnings:
+                key = (w.warning_type, w.file_path, w.message)
+                if key not in seen_warnings:
+                    seen_warnings.add(key)
+                    all_warnings.append(w)
+
+        return all_results, all_warnings
 
 
 # --- Output Formatting ---
@@ -690,23 +1066,129 @@ def print_results(results: list[ScanResult]):
             print(f"     Found in: {r.lock_file}")
 
 
-def export_json(results: list[ScanResult], filepath: str):
-    """Export results to JSON file."""
-    data = [
-        {
-            "ref_name": r.ref_name,
-            "ref_type": r.ref_type,
-            "package_name": r.package_name,
-            "installed_version": r.installed_version,
-            "affected_version": r.affected_version,
-            "lock_file": r.lock_file,
-            "is_exact_version": r.is_exact_version
-        }
-        for r in results
-    ]
+def export_json(results: list[ScanResult], warnings: list[SecurityWarning], filepath: str):
+    """Export results and warnings to JSON file."""
+    data = {
+        "malicious_packages": [
+            {
+                "ref_name": r.ref_name,
+                "ref_type": r.ref_type,
+                "package_name": r.package_name,
+                "installed_version": r.installed_version,
+                "affected_version": r.affected_version,
+                "lock_file": r.lock_file,
+                "is_exact_version": r.is_exact_version
+            }
+            for r in results
+        ],
+        "security_warnings": [
+            {
+                "warning_type": w.warning_type,
+                "severity": w.severity,
+                "file_path": w.file_path,
+                "message": w.message,
+                "package_name": w.package_name,
+                "details": w.details
+            }
+            for w in warnings
+        ]
+    }
     with open(filepath, 'w') as f:
         json.dump(data, f, indent=2)
     print(f"\nResults exported to: {filepath}")
+
+
+def print_security_warnings(warnings: list[SecurityWarning], repo_name: str = ""):
+    """Print security warnings for a repository."""
+    if not warnings:
+        return
+
+    # Group warnings by type
+    unpinned = [w for w in warnings if w.warning_type == 'unpinned_dependency']
+    missing_lock = [w for w in warnings if w.warning_type == 'missing_lock_file']
+    lockfile_injection = [w for w in warnings if w.warning_type == 'lockfile_injection']
+    dependency_bot = [w for w in warnings if w.warning_type == 'dependency_bot']
+
+    header = f"SECURITY WARNINGS for {repo_name}" if repo_name else "SECURITY WARNINGS"
+    print(f"\n⚠️  {header}:")
+    print("-" * 50)
+
+    if unpinned:
+        print(f"\n⚠️  NON-PINNED DEPENDENCIES ({len(unpinned)} found)")
+        print("   These use version ranges that could resolve to malicious versions:\n")
+        for w in unpinned[:10]:  # Limit to first 10 to avoid overwhelming output
+            print(f"   • {w.message}")
+            print(f"     File: {w.file_path}")
+        if len(unpinned) > 10:
+            print(f"\n   ... and {len(unpinned) - 10} more unpinned dependencies")
+        print(f"\n   Fix: Pin dependencies to exact versions (remove ^, ~, etc.)")
+
+    if missing_lock:
+        print(f"\n⚠️  MISSING LOCK FILES ({len(missing_lock)} found)")
+        for w in missing_lock:
+            print(f"   • {w.file_path}")
+            print(f"     {w.details}")
+
+    if lockfile_injection:
+        print(f"\n⚠️  SUSPICIOUS LOCKFILE ENTRIES ({len(lockfile_injection)} found)")
+        for w in lockfile_injection:
+            print(f"   • {w.message}")
+            print(f"     File: {w.file_path}")
+            if w.details:
+                print(f"     {w.details}")
+
+    if dependency_bot:
+        print(f"\nℹ️  DEPENDENCY BOT CONFIGURATION")
+        for w in dependency_bot:
+            if w.severity == 'info':
+                print(f"   • {w.message}")
+                print(f"     {w.details}")
+            else:
+                print(f"   ⚠️  {w.message}")
+                print(f"     {w.details}")
+
+
+def print_security_recommendations(quiet: bool = False):
+    """Print general security recommendations once at end of all scans."""
+    if quiet:
+        return
+
+    print("\n" + "=" * 60)
+    print("💡 GENERAL SECURITY RECOMMENDATIONS")
+    print("=" * 60)
+
+    print("""
+1. USE DETERMINISTIC INSTALLS
+   Always use commands that install exactly what's in your lock file:
+   • npm:  npm ci
+   • yarn: yarn install --frozen-lockfile
+   • pnpm: pnpm install --frozen-lockfile
+
+2. DISABLE POSTINSTALL SCRIPTS
+   Combine frozen lockfile with --ignore-scripts:
+   • npm:  npm ci --ignore-scripts
+   • yarn: yarn install --frozen-lockfile --ignore-scripts
+   • pnpm: pnpm install --frozen-lockfile --ignore-scripts
+
+   Note: pnpm v10+ and bun disable scripts by default.
+
+3. AVOID BLIND DEPENDENCY UPGRADES
+   Never run `npm update` or `npx npm-check-updates -u`.
+   Use interactive mode or security-aware bots with PR review.
+
+4. VALIDATE LOCKFILES
+   Use lockfile-lint to detect lockfile injection attacks:
+   npx lockfile-lint --path package-lock.json --allowed-hosts npm --validate-https
+
+5. USE VERSION COOLDOWN
+   Avoid brand-new package versions. Use pnpm's minimumReleaseAge or npq.
+
+6. USE DEV CONTAINERS
+   Sandbox your development environment to limit blast radius.
+
+For more details: https://snyk.io/articles/npm-security-best-practices-shai-hulud-attack/
+""")
+    print("=" * 60)
 
 
 # --- Main ---
@@ -827,36 +1309,37 @@ def parse_github_url(url: str) -> Optional[tuple[str, str]]:
 
 
 def scan_local_folder(
-    root_path: str, 
-    github_token: Optional[str], 
+    root_path: str,
+    github_token: Optional[str],
     affected_packages: dict[str, str],
     verbose: bool = False,
     max_depth: int = 5
-) -> dict[str, list[ScanResult]]:
+) -> tuple[dict[str, list[ScanResult]], dict[str, list[SecurityWarning]]]:
     """
     Scan all git repositories under a local folder.
-    
+
     Args:
         root_path: Path to the root folder to scan
         github_token: GitHub API token
         affected_packages: Dict of known malicious packages
         verbose: Enable verbose output
         max_depth: Maximum directory depth to search
-    
+
     Returns:
-        Dict mapping repo paths to their scan results
+        Tuple of (results_dict, warnings_dict) mapping repo names to their findings
     """
     all_results = {}
-    
+    all_warnings = {}
+
     print(f"🔍 Searching for git repositories in: {root_path}")
     git_repos = find_git_repos(root_path, max_depth=max_depth)
-    
+
     if not git_repos:
         print("  No git repositories found.")
-        return all_results
-    
+        return all_results, all_warnings
+
     print(f"  Found {len(git_repos)} git repository(ies)\n")
-    
+
     # Filter to only GitHub repos
     github_repos = []
     for repo_path in git_repos:
@@ -869,65 +1352,79 @@ def scan_local_folder(
                 print(f"  ⚠️  Could not parse GitHub URL: {url}")
         else:
             print(f"  ⏭️  Skipping (not a GitHub repo): {repo_path.name}")
-    
+
     if not github_repos:
         print("\nNo GitHub repositories found.")
-        return all_results
-    
+        return all_results, all_warnings
+
     print(f"\n📦 Found {len(github_repos)} GitHub repository(ies) to scan:\n")
     for repo_path, owner, repo in github_repos:
         print(f"  • {owner}/{repo} ({repo_path})")
-    
+
     print("\n" + "=" * 60)
-    
+
     # Scan each GitHub repo
     for i, (repo_path, owner, repo) in enumerate(github_repos, 1):
         print(f"\n[{i}/{len(github_repos)}] Scanning {owner}/{repo}...")
         print("-" * 50)
-        
+
         try:
             scanner = RepoScanner(owner, repo, github_token, verbose=verbose)
             scanner.affected_packages = affected_packages
-            
+
             # Quick access check
             if not scanner.check_access():
                 print(f"  ❌ Cannot access repository")
                 continue
-            
-            results = scanner.scan_all(include_branches=True, include_prs=True)
-            
+
+            results, warnings = scanner.scan_all(include_branches=True, include_prs=True)
+
+            repo_name = f"{owner}/{repo}"
             if results:
-                all_results[f"{owner}/{repo}"] = results
+                all_results[repo_name] = results
                 print_results(results)
             else:
                 print("\n  ✅ No malicious packages detected")
-                
+
+            if warnings:
+                all_warnings[repo_name] = warnings
+                print_security_warnings(warnings, repo_name)
+
         except Exception as e:
             print(f"  ❌ Error scanning: {e}")
-    
-    return all_results
+
+    return all_results, all_warnings
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scan GitHub repositories for known malicious npm packages.",
+        description="Scan GitHub repositories for known malicious npm packages and security issues.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Scan a single repository
   %(prog)s --repo owner/repo-name
   %(prog)s --repo https://github.com/owner/repo-name --github-token ghp_xxxx
-  
+
   # Scan only branches or PRs
   %(prog)s --repo owner/repo --branches-only
   %(prog)s --repo owner/repo --prs-only --output results.json
-  
+
   # Scan all git repos in a local folder
   %(prog)s --local-path ~/projects --github-token ghp_xxxx
   %(prog)s --local-path /code/repos --github-token ghp_xxxx --output results.json
+
+  # Suppress security recommendations
+  %(prog)s --repo owner/repo --quiet
+
+Security Hygiene (always enabled):
+  • Non-pinned dependencies in package.json
+  • Missing lock files
+  • Lockfile injection detection
+  • Dependency bot configuration analysis
         """
     )
-    
+
     # Repository source (mutually exclusive)
     source_group = parser.add_mutually_exclusive_group(required=True)
     source_group.add_argument(
@@ -940,7 +1437,7 @@ Examples:
         type=str,
         help="Local folder path to scan for git repositories"
     )
-    
+
     parser.add_argument(
         "--max-depth",
         type=int,
@@ -978,16 +1475,21 @@ Examples:
         help="Enable verbose/debug output"
     )
     parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress general security recommendations at end"
+    )
+    parser.add_argument(
         "--list-lock-files",
         action="store_true",
         help="Just list where dependency files are found (on default branch), don't scan"
     )
-    
+
     args = parser.parse_args()
-    
+
     print(f"🔍 NPM Malicious Package Scanner")
     print()
-    
+
     # Handle local folder scanning
     if args.local_path:
         # Load malicious packages first
@@ -997,63 +1499,87 @@ Examples:
         else:
             affected_packages = fetch_affected_packages()
         print(f"Loaded {len(affected_packages)} known malicious packages\n")
-        
+
         # Scan local folder
-        all_results = scan_local_folder(
+        all_results, all_warnings = scan_local_folder(
             args.local_path,
             args.github_token,
             affected_packages,
             verbose=args.verbose,
             max_depth=args.max_depth
         )
-        
+
         # Summary
         print("\n" + "=" * 60)
         print("📊 SUMMARY")
         print("=" * 60)
-        
+
         total_matches = sum(len(r) for r in all_results.values())
+        total_warnings = sum(len(w) for w in all_warnings.values())
+
         if total_matches:
             print(f"\n⚠️  Found {total_matches} malicious package match(es) across {len(all_results)} repo(s):")
             for repo_name, results in all_results.items():
                 print(f"  • {repo_name}: {len(results)} match(es)")
         else:
             print("\n✅ No malicious packages detected in any repository!")
-        
+
+        if total_warnings:
+            # Count warnings by type
+            unpinned_count = sum(1 for ws in all_warnings.values() for w in ws if w.warning_type == 'unpinned_dependency')
+            missing_lock_count = sum(1 for ws in all_warnings.values() for w in ws if w.warning_type == 'missing_lock_file')
+            injection_count = sum(1 for ws in all_warnings.values() for w in ws if w.warning_type == 'lockfile_injection')
+            bot_count = sum(1 for ws in all_warnings.values() for w in ws if w.warning_type == 'dependency_bot')
+
+            print(f"\nSecurity warnings found:")
+            if unpinned_count:
+                print(f"  • {unpinned_count} non-pinned dependencies")
+            if missing_lock_count:
+                print(f"  • {missing_lock_count} missing lock files")
+            if injection_count:
+                print(f"  • {injection_count} suspicious lockfile entries")
+            if bot_count:
+                print(f"  • {bot_count} dependency bot configs to review")
+
         # Export combined results
         if args.output:
             combined_results = []
+            combined_warnings = []
             for repo_name, results in all_results.items():
-                for r in results:
-                    combined_results.append(r)
-            export_json(combined_results, args.output)
-        
+                combined_results.extend(results)
+            for repo_name, warnings in all_warnings.items():
+                combined_warnings.extend(warnings)
+            export_json(combined_results, combined_warnings, args.output)
+
+        # Print general recommendations at the end (once)
+        print_security_recommendations(quiet=args.quiet)
+
         sys.exit(1 if total_matches else 0)
-    
+
     # Handle single repo scanning
     try:
         owner, repo = parse_repo_arg(args.repo)
     except ValueError as e:
         parser.error(str(e))
-    
+
     print(f"   Repository: {owner}/{repo}")
     print()
-    
+
     # Determine what to scan
     include_branches = not args.prs_only
     include_prs = not args.branches_only
-    
+
     if not include_branches and not include_prs:
         parser.error("Cannot use both --branches-only and --prs-only")
-    
+
     # Create scanner and run
     scanner = RepoScanner(owner, repo, args.github_token, verbose=args.verbose)
-    
+
     # Verify access first
     if not scanner.check_access():
         sys.exit(1)
     print()
-    
+
     # If just listing lock files, do that and exit
     if args.list_lock_files:
         print("Searching for dependency files on default branch...")
@@ -1062,16 +1588,16 @@ Examples:
         if not branches:
             print("No branches found.")
             sys.exit(1)
-        
+
         # Use first branch (usually main/master)
         default_ref = branches[0]
         print(f"Using branch: {default_ref.name} ({default_ref.sha[:7]})")
-        
+
         dep_files = scanner.api.find_dependency_files(owner, repo, default_ref.sha)
         if dep_files:
             lock_files = [f for f in dep_files if not f.endswith('package.json')]
             package_jsons = [f for f in dep_files if f.endswith('package.json')]
-            
+
             print(f"\nFound {len(dep_files)} dependency file(s):")
             if lock_files:
                 print("\n  Lock files (exact versions):")
@@ -1085,17 +1611,24 @@ Examples:
             print("\n❌ No dependency files found")
             print("   This repo may not be an npm/Node.js project.")
         sys.exit(0)
-    
+
     scanner.load_affected_packages(args.malicious_list_url)
-    
-    results = scanner.scan_all(include_branches=include_branches, include_prs=include_prs)
-    
+
+    results, warnings = scanner.scan_all(include_branches=include_branches, include_prs=include_prs)
+
     # Output results
     print_results(results)
-    
+
+    # Output security warnings
+    if warnings:
+        print_security_warnings(warnings, f"{owner}/{repo}")
+
     if args.output:
-        export_json(results, args.output)
-    
+        export_json(results, warnings, args.output)
+
+    # Print general recommendations at the end
+    print_security_recommendations(quiet=args.quiet)
+
     # Exit with error code if matches found
     sys.exit(1 if results else 0)
 
