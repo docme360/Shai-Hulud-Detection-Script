@@ -1597,7 +1597,7 @@ Security Hygiene (always enabled):
     source_group.add_argument(
         "--repo",
         type=str,
-        help="GitHub repository (owner/repo or full URL)"
+        help="GitHub repository or comma-separated list (owner/repo,owner/repo2 or full URLs)"
     )
     source_group.add_argument(
         "--local-path",
@@ -1729,14 +1729,17 @@ Security Hygiene (always enabled):
 
         sys.exit(1 if total_matches else 0)
 
-    # Handle single repo scanning
-    try:
-        owner, repo = parse_repo_arg(args.repo)
-    except ValueError as e:
-        parser.error(str(e))
+    # Handle repo scanning (single or multiple)
+    # Parse comma-separated repos
+    repo_args = [r.strip() for r in args.repo.split(',') if r.strip()]
 
-    print(f"   Repository: {owner}/{repo}")
-    print()
+    repos_to_scan = []
+    for repo_arg in repo_args:
+        try:
+            owner, repo = parse_repo_arg(repo_arg)
+            repos_to_scan.append((owner, repo))
+        except ValueError as e:
+            parser.error(str(e))
 
     # Determine what to scan
     include_branches = not args.prs_only
@@ -1749,72 +1752,145 @@ Security Hygiene (always enabled):
     if not include_branches and not include_prs:
         parser.error("Cannot use both --branches-only and --prs-only")
 
-    # Create scanner and run
-    scanner = RepoScanner(owner, repo, args.github_token, verbose=args.verbose)
-
-    # Verify access first
-    if not scanner.check_access():
-        sys.exit(1)
-    print()
-
-    # If just listing lock files, do that and exit
+    # If just listing lock files, do that for each repo and exit
     if args.list_lock_files:
-        print("Searching for dependency files on default branch...")
-        # Get default branch
-        branches = scanner.api.get_branches(owner, repo)
-        if not branches:
-            print("No branches found.")
-            sys.exit(1)
+        for owner, repo in repos_to_scan:
+            print(f"\n{'=' * 60}")
+            print(f"Repository: {owner}/{repo}")
+            print("Searching for dependency files on default branch...")
 
-        # Use first branch (usually main/master)
-        default_ref = branches[0]
-        print(f"Using branch: {default_ref.name} ({default_ref.sha[:7]})")
+            scanner = RepoScanner(owner, repo, args.github_token, verbose=args.verbose)
+            branches = scanner.api.get_branches(owner, repo)
+            if not branches:
+                print("No branches found.")
+                continue
 
-        dep_files = scanner.api.find_dependency_files(owner, repo, default_ref.sha)
-        if dep_files:
-            lock_files = [f for f in dep_files if not f.endswith('package.json')]
-            package_jsons = [f for f in dep_files if f.endswith('package.json')]
+            default_ref = branches[0]
+            print(f"Using branch: {default_ref.name} ({default_ref.sha[:7]})")
 
-            print(f"\nFound {len(dep_files)} dependency file(s):")
-            if lock_files:
-                print("\n  Lock files (exact versions):")
-                for lf in sorted(lock_files):
-                    print(f"    📄 {lf}")
-            if package_jsons:
-                print("\n  package.json files (version ranges):")
-                for pj in sorted(package_jsons):
-                    print(f"    📦 {pj}")
-        else:
-            print("\n❌ No dependency files found")
-            print("   This repo may not be an npm/Node.js project.")
+            dep_files = scanner.api.find_dependency_files(owner, repo, default_ref.sha)
+            if dep_files:
+                lock_files = [f for f in dep_files if not f.endswith('package.json')]
+                package_jsons = [f for f in dep_files if f.endswith('package.json')]
+
+                print(f"\nFound {len(dep_files)} dependency file(s):")
+                if lock_files:
+                    print("\n  Lock files (exact versions):")
+                    for lf in sorted(lock_files):
+                        print(f"    📄 {lf}")
+                if package_jsons:
+                    print("\n  package.json files (version ranges):")
+                    for pj in sorted(package_jsons):
+                        print(f"    📦 {pj}")
+            else:
+                print("\n❌ No dependency files found")
+                print("   This repo may not be an npm/Node.js project.")
         sys.exit(0)
 
-    scanner.load_affected_packages(args.malicious_list_url)
+    # Load malicious packages once
+    print("Loading malicious package list...")
+    if args.malicious_list_url:
+        affected_packages = fetch_affected_packages(args.malicious_list_url)
+    else:
+        affected_packages = fetch_affected_packages()
+    print(f"Loaded {len(affected_packages)} known malicious packages\n")
 
-    results, warnings = scanner.scan_all(include_branches=include_branches, include_prs=include_prs,
-                                         default_branch_only=default_branch_only)
+    # Track results across all repos
+    all_results: dict[str, list[ScanResult]] = {}
+    all_warnings: dict[str, list[SecurityWarning]] = {}
+    all_access_info: list[RepoAccessInfo] = []
 
-    # Output results
-    print_results(results)
+    # Scan each repository
+    for i, (owner, repo) in enumerate(repos_to_scan, 1):
+        repo_name = f"{owner}/{repo}"
 
-    # Output security warnings
-    if warnings:
-        print_security_warnings(warnings, f"{owner}/{repo}")
+        if len(repos_to_scan) > 1:
+            print(f"\n{'=' * 60}")
+            print(f"[{i}/{len(repos_to_scan)}] Scanning {repo_name}...")
+            print("-" * 50)
+        else:
+            print(f"   Repository: {repo_name}")
+            print()
 
-    # Fetch and export repository access information if outputting to JSON
-    access_info = None
+        scanner = RepoScanner(owner, repo, args.github_token, verbose=args.verbose)
+        scanner.affected_packages = affected_packages
+
+        # Verify access first
+        if not scanner.check_access():
+            print(f"  ❌ Cannot access repository")
+            continue
+        print()
+
+        results, warnings = scanner.scan_all(include_branches=include_branches, include_prs=include_prs,
+                                             default_branch_only=default_branch_only)
+
+        # Store results
+        if results:
+            all_results[repo_name] = results
+            print_results(results)
+        else:
+            print("\n✅ No malicious packages detected!")
+
+        if warnings:
+            all_warnings[repo_name] = warnings
+            print_security_warnings(warnings, repo_name)
+
+        # Fetch repository access information
+        if args.output:
+            try:
+                access_info = scanner.get_access_info()
+                all_access_info.append(access_info)
+            except Exception as e:
+                print(f"\n⚠️  Could not fetch access info: {e}")
+
+    # Summary for multiple repos
+    if len(repos_to_scan) > 1:
+        print("\n" + "=" * 60)
+        print("📊 SUMMARY")
+        print("=" * 60)
+
+        total_matches = sum(len(r) for r in all_results.values())
+        total_warnings = sum(len(w) for w in all_warnings.values())
+
+        if total_matches:
+            print(f"\n⚠️  Found {total_matches} malicious package match(es) across {len(all_results)} repo(s):")
+            for repo_name, results in all_results.items():
+                print(f"  • {repo_name}: {len(results)} match(es)")
+        else:
+            print("\n✅ No malicious packages detected in any repository!")
+
+        if total_warnings:
+            unpinned_count = sum(1 for ws in all_warnings.values() for w in ws if w.warning_type == 'unpinned_dependency')
+            missing_lock_count = sum(1 for ws in all_warnings.values() for w in ws if w.warning_type == 'missing_lock_file')
+            injection_count = sum(1 for ws in all_warnings.values() for w in ws if w.warning_type == 'lockfile_injection')
+            bot_count = sum(1 for ws in all_warnings.values() for w in ws if w.warning_type == 'dependency_bot')
+
+            print(f"\nSecurity warnings found:")
+            if unpinned_count:
+                print(f"  • {unpinned_count} non-pinned dependencies")
+            if missing_lock_count:
+                print(f"  • {missing_lock_count} missing lock files")
+            if injection_count:
+                print(f"  • {injection_count} suspicious lockfile entries")
+            if bot_count:
+                print(f"  • {bot_count} dependency bot configs to review")
+
+    # Export combined results
     if args.output:
-        try:
-            access_info = scanner.get_access_info()
-        except Exception as e:
-            print(f"\n⚠️  Could not fetch access info: {e}")
-        export_json(results, warnings, args.output, [access_info] if access_info else None)
+        combined_results = []
+        combined_warnings = []
+        for repo_name, results in all_results.items():
+            combined_results.extend(results)
+        for repo_name, warnings in all_warnings.items():
+            combined_warnings.extend(warnings)
+        export_json(combined_results, combined_warnings, args.output, all_access_info if all_access_info else None)
 
     # Print general recommendations at the end
     print_security_recommendations(quiet=args.quiet)
 
     # Exit with error code if matches found
-    sys.exit(1 if results else 0)
+    total_matches = sum(len(r) for r in all_results.values())
+    sys.exit(1 if total_matches else 0)
 
 
 if __name__ == "__main__":
