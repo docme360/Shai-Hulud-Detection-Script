@@ -16,6 +16,7 @@ import subprocess
 import sys
 import urllib.request
 import urllib.error
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -53,6 +54,14 @@ class SecurityWarning:
     message: str
     package_name: Optional[str] = None
     details: Optional[str] = None
+
+
+@dataclass
+class RepoAccessInfo:
+    """Represents access information for a repository."""
+    repo_name: str
+    collaborators: list[dict]  # Direct user access
+    teams: list[dict]  # Team access with members
 
 
 # --- GitHub API ---
@@ -143,7 +152,25 @@ class GitHubAPI:
         """Check if we have access to a repo and what permissions we have."""
         data = self._request(f"/repos/{owner}/{repo}")
         return data
-    
+
+    def get_default_branch(self, owner: str, repo: str) -> Optional[str]:
+        """Get the default branch name for a repository."""
+        data = self._request(f"/repos/{owner}/{repo}")
+        if data:
+            return data.get("default_branch")
+        return None
+
+    def get_branch(self, owner: str, repo: str, branch_name: str) -> Optional[RefInfo]:
+        """Get a specific branch by name."""
+        data = self._request(f"/repos/{owner}/{repo}/branches/{branch_name}")
+        if data:
+            return RefInfo(
+                name=data["name"],
+                ref_type="branch",
+                sha=data["commit"]["sha"]
+            )
+        return None
+
     def get_repo_tree(self, owner: str, repo: str, sha: str) -> list[dict]:
         """Get the full file tree for a commit (recursive)."""
         data = self._request(f"/repos/{owner}/{repo}/git/trees/{sha}?recursive=1")
@@ -224,12 +251,78 @@ class GitHubAPI:
     
     def get_file_content(self, owner: str, repo: str, path: str, ref: str) -> Optional[str]:
         """Get the content of a file at a specific ref."""
-        data = self._request(f"/repos/{owner}/{repo}/contents/{path}?ref={ref}")
+        # URL-encode the path to handle spaces and special characters
+        encoded_path = urllib.parse.quote(path, safe='/')
+        data = self._request(f"/repos/{owner}/{repo}/contents/{encoded_path}?ref={ref}")
         if data is None or isinstance(data, list):
             return None
         if data.get("encoding") == "base64":
             return base64.b64decode(data["content"]).decode('utf-8')
         return None
+
+    def get_collaborators(self, owner: str, repo: str) -> list[dict]:
+        """Get all collaborators (users with direct access) for a repository."""
+        collaborators = []
+        page = 1
+        while True:
+            if self.verbose:
+                print(f"    [DEBUG] Fetching collaborators page {page}...")
+            data = self._request(f"/repos/{owner}/{repo}/collaborators?per_page=100&page={page}")
+            if not data:
+                break
+            for user in data:
+                collaborators.append({
+                    "login": user.get("login"),
+                    "type": "user",
+                    "permissions": user.get("permissions", {}),
+                    "role_name": user.get("role_name", "unknown")
+                })
+            if len(data) < 100:
+                break
+            page += 1
+        return collaborators
+
+    def get_repo_teams(self, owner: str, repo: str) -> list[dict]:
+        """Get all teams with access to a repository."""
+        teams = []
+        page = 1
+        while True:
+            if self.verbose:
+                print(f"    [DEBUG] Fetching repo teams page {page}...")
+            data = self._request(f"/repos/{owner}/{repo}/teams?per_page=100&page={page}")
+            if not data:
+                break
+            for team in data:
+                teams.append({
+                    "name": team.get("name"),
+                    "slug": team.get("slug"),
+                    "permission": team.get("permission"),
+                    "privacy": team.get("privacy")
+                })
+            if len(data) < 100:
+                break
+            page += 1
+        return teams
+
+    def get_team_members(self, org: str, team_slug: str) -> list[dict]:
+        """Get all members of a team."""
+        members = []
+        page = 1
+        while True:
+            if self.verbose:
+                print(f"    [DEBUG] Fetching team {team_slug} members page {page}...")
+            data = self._request(f"/orgs/{org}/teams/{team_slug}/members?per_page=100&page={page}")
+            if not data:
+                break
+            for member in data:
+                members.append({
+                    "login": member.get("login"),
+                    "type": member.get("type", "User")
+                })
+            if len(data) < 100:
+                break
+            page += 1
+        return members
 
 
 # --- Lock File Parsers ---
@@ -385,17 +478,21 @@ def parse_package_json(content: str) -> dict[str, str]:
         data = json.loads(content)
     except json.JSONDecodeError:
         return packages
-    
+
+    # Ensure data is a dict (some files may have unexpected formats)
+    if not isinstance(data, dict):
+        return packages
+
     # Check all dependency types
     dep_keys = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']
-    
+
     for key in dep_keys:
         deps = data.get(key, {})
         if isinstance(deps, dict):
             for name, version in deps.items():
                 if isinstance(version, str):
                     packages[name] = version
-    
+
     return packages
 
 
@@ -958,23 +1055,37 @@ class RepoScanner:
 
         return results, warnings
     
-    def scan_all(self, include_branches: bool = True, include_prs: bool = True) -> tuple[list[ScanResult], list[SecurityWarning]]:
+    def scan_all(self, include_branches: bool = True, include_prs: bool = True,
+                 default_branch_only: bool = False) -> tuple[list[ScanResult], list[SecurityWarning]]:
         """Scan all branches and/or PRs in the repository."""
         all_results = []
         all_warnings = []
         refs_to_scan = []
 
-        if include_branches:
-            print(f"Fetching branches for {self.owner}/{self.repo}...")
-            branches = self.api.get_branches(self.owner, self.repo)
-            print(f"  Found {len(branches)} branches")
-            refs_to_scan.extend(branches)
+        if default_branch_only:
+            # Only scan the default branch
+            default_branch_name = self.api.get_default_branch(self.owner, self.repo)
+            if default_branch_name:
+                print(f"Fetching default branch '{default_branch_name}' for {self.owner}/{self.repo}...")
+                default_ref = self.api.get_branch(self.owner, self.repo, default_branch_name)
+                if default_ref:
+                    refs_to_scan.append(default_ref)
+                else:
+                    print(f"  ⚠️  Could not fetch default branch")
+            else:
+                print(f"  ⚠️  Could not determine default branch")
+        else:
+            if include_branches:
+                print(f"Fetching branches for {self.owner}/{self.repo}...")
+                branches = self.api.get_branches(self.owner, self.repo)
+                print(f"  Found {len(branches)} branches")
+                refs_to_scan.extend(branches)
 
-        if include_prs:
-            print(f"Fetching open PRs for {self.owner}/{self.repo}...")
-            prs = self.api.get_open_prs(self.owner, self.repo)
-            print(f"  Found {len(prs)} open PRs")
-            refs_to_scan.extend(prs)
+            if include_prs:
+                print(f"Fetching open PRs for {self.owner}/{self.repo}...")
+                prs = self.api.get_open_prs(self.owner, self.repo)
+                print(f"  Found {len(prs)} open PRs")
+                refs_to_scan.extend(prs)
 
         if not refs_to_scan:
             print("No refs to scan.")
@@ -1030,6 +1141,38 @@ class RepoScanner:
 
         return all_results, all_warnings
 
+    def get_access_info(self) -> RepoAccessInfo:
+        """Fetch repository access information (collaborators and teams with members)."""
+        print(f"\nFetching repository access information...")
+
+        # Get direct collaborators
+        collaborators = self.api.get_collaborators(self.owner, self.repo)
+        print(f"  Found {len(collaborators)} collaborator(s)")
+
+        # Get teams with access
+        teams_raw = self.api.get_repo_teams(self.owner, self.repo)
+        print(f"  Found {len(teams_raw)} team(s)")
+
+        # For each team, fetch its members
+        teams_with_members = []
+        for team in teams_raw:
+            members = self.api.get_team_members(self.owner, team["slug"])
+            teams_with_members.append({
+                "name": team["name"],
+                "slug": team["slug"],
+                "permission": team["permission"],
+                "privacy": team.get("privacy"),
+                "members": members
+            })
+            if members:
+                print(f"    • {team['name']}: {len(members)} member(s)")
+
+        return RepoAccessInfo(
+            repo_name=f"{self.owner}/{self.repo}",
+            collaborators=collaborators,
+            teams=teams_with_members
+        )
+
 
 # --- Output Formatting ---
 
@@ -1066,8 +1209,9 @@ def print_results(results: list[ScanResult]):
             print(f"     Found in: {r.lock_file}")
 
 
-def export_json(results: list[ScanResult], warnings: list[SecurityWarning], filepath: str):
-    """Export results and warnings to JSON file."""
+def export_json(results: list[ScanResult], warnings: list[SecurityWarning], filepath: str,
+                access_info: Optional[list[RepoAccessInfo]] = None):
+    """Export results, warnings, and repository access information to JSON file in the output folder."""
     data = {
         "malicious_packages": [
             {
@@ -1093,9 +1237,28 @@ def export_json(results: list[ScanResult], warnings: list[SecurityWarning], file
             for w in warnings
         ]
     }
-    with open(filepath, 'w') as f:
+
+    # Add repository access information if provided
+    if access_info:
+        data["repository_access"] = [
+            {
+                "repo_name": info.repo_name,
+                "collaborators": info.collaborators,
+                "teams": info.teams
+            }
+            for info in access_info
+        ]
+
+    # Ensure output directory exists
+    output_dir = Path("output")
+    output_dir.mkdir(exist_ok=True)
+
+    # Place the file in the output directory
+    output_path = output_dir / Path(filepath).name
+
+    with open(output_path, 'w') as f:
         json.dump(data, f, indent=2)
-    print(f"\nResults exported to: {filepath}")
+    print(f"\nResults exported to: {output_path}")
 
 
 def print_security_warnings(warnings: list[SecurityWarning], repo_name: str = ""):
@@ -1313,8 +1476,9 @@ def scan_local_folder(
     github_token: Optional[str],
     affected_packages: dict[str, str],
     verbose: bool = False,
-    max_depth: int = 5
-) -> tuple[dict[str, list[ScanResult]], dict[str, list[SecurityWarning]]]:
+    max_depth: int = 5,
+    default_branch_only: bool = False
+) -> tuple[dict[str, list[ScanResult]], dict[str, list[SecurityWarning]], list[RepoAccessInfo]]:
     """
     Scan all git repositories under a local folder.
 
@@ -1324,19 +1488,21 @@ def scan_local_folder(
         affected_packages: Dict of known malicious packages
         verbose: Enable verbose output
         max_depth: Maximum directory depth to search
+        default_branch_only: Only scan the default branch (main/master)
 
     Returns:
-        Tuple of (results_dict, warnings_dict) mapping repo names to their findings
+        Tuple of (results_dict, warnings_dict, access_info_list) mapping repo names to their findings
     """
     all_results = {}
     all_warnings = {}
+    all_access_info = []
 
     print(f"🔍 Searching for git repositories in: {root_path}")
     git_repos = find_git_repos(root_path, max_depth=max_depth)
 
     if not git_repos:
         print("  No git repositories found.")
-        return all_results, all_warnings
+        return all_results, all_warnings, all_access_info
 
     print(f"  Found {len(git_repos)} git repository(ies)\n")
 
@@ -1355,7 +1521,7 @@ def scan_local_folder(
 
     if not github_repos:
         print("\nNo GitHub repositories found.")
-        return all_results, all_warnings
+        return all_results, all_warnings, all_access_info
 
     print(f"\n📦 Found {len(github_repos)} GitHub repository(ies) to scan:\n")
     for repo_path, owner, repo in github_repos:
@@ -1377,7 +1543,8 @@ def scan_local_folder(
                 print(f"  ❌ Cannot access repository")
                 continue
 
-            results, warnings = scanner.scan_all(include_branches=True, include_prs=True)
+            results, warnings = scanner.scan_all(include_branches=True, include_prs=True,
+                                                  default_branch_only=default_branch_only)
 
             repo_name = f"{owner}/{repo}"
             if results:
@@ -1390,10 +1557,17 @@ def scan_local_folder(
                 all_warnings[repo_name] = warnings
                 print_security_warnings(warnings, repo_name)
 
+            # Fetch repository access information
+            try:
+                access_info = scanner.get_access_info()
+                all_access_info.append(access_info)
+            except Exception as e:
+                print(f"  ⚠️  Could not fetch access info: {e}")
+
         except Exception as e:
             print(f"  ❌ Error scanning: {e}")
 
-    return all_results, all_warnings
+    return all_results, all_warnings, all_access_info
 
 
 def main():
@@ -1430,7 +1604,7 @@ Security Hygiene (always enabled):
     source_group.add_argument(
         "--repo",
         type=str,
-        help="GitHub repository (owner/repo or full URL)"
+        help="GitHub repository or comma-separated list (owner/repo,owner/repo2 or full URLs)"
     )
     source_group.add_argument(
         "--local-path",
@@ -1458,6 +1632,11 @@ Security Hygiene (always enabled):
         "--prs-only",
         action="store_true",
         help="Only scan open PRs, not branches"
+    )
+    parser.add_argument(
+        "--default-branch-only",
+        action="store_true",
+        help="Only scan the default branch (main/master), skip all other branches and PRs"
     )
     parser.add_argument(
         "--malicious-list-url",
@@ -1501,12 +1680,13 @@ Security Hygiene (always enabled):
         print(f"Loaded {len(affected_packages)} known malicious packages\n")
 
         # Scan local folder
-        all_results, all_warnings = scan_local_folder(
+        all_results, all_warnings, all_access_info = scan_local_folder(
             args.local_path,
             args.github_token,
             affected_packages,
             verbose=args.verbose,
-            max_depth=args.max_depth
+            max_depth=args.max_depth,
+            default_branch_only=args.default_branch_only
         )
 
         # Summary
@@ -1549,88 +1729,175 @@ Security Hygiene (always enabled):
                 combined_results.extend(results)
             for repo_name, warnings in all_warnings.items():
                 combined_warnings.extend(warnings)
-            export_json(combined_results, combined_warnings, args.output)
+            export_json(combined_results, combined_warnings, args.output, all_access_info)
 
         # Print general recommendations at the end (once)
         print_security_recommendations(quiet=args.quiet)
 
         sys.exit(1 if total_matches else 0)
 
-    # Handle single repo scanning
-    try:
-        owner, repo = parse_repo_arg(args.repo)
-    except ValueError as e:
-        parser.error(str(e))
+    # Handle repo scanning (single or multiple)
+    # Parse comma-separated repos
+    repo_args = [r.strip() for r in args.repo.split(',') if r.strip()]
 
-    print(f"   Repository: {owner}/{repo}")
-    print()
+    repos_to_scan = []
+    for repo_arg in repo_args:
+        try:
+            owner, repo = parse_repo_arg(repo_arg)
+            repos_to_scan.append((owner, repo))
+        except ValueError as e:
+            parser.error(str(e))
 
     # Determine what to scan
     include_branches = not args.prs_only
     include_prs = not args.branches_only
+    default_branch_only = args.default_branch_only
+
+    if default_branch_only and (args.branches_only or args.prs_only):
+        parser.error("Cannot use --default-branch-only with --branches-only or --prs-only")
 
     if not include_branches and not include_prs:
         parser.error("Cannot use both --branches-only and --prs-only")
 
-    # Create scanner and run
-    scanner = RepoScanner(owner, repo, args.github_token, verbose=args.verbose)
-
-    # Verify access first
-    if not scanner.check_access():
-        sys.exit(1)
-    print()
-
-    # If just listing lock files, do that and exit
+    # If just listing lock files, do that for each repo and exit
     if args.list_lock_files:
-        print("Searching for dependency files on default branch...")
-        # Get default branch
-        branches = scanner.api.get_branches(owner, repo)
-        if not branches:
-            print("No branches found.")
-            sys.exit(1)
+        for owner, repo in repos_to_scan:
+            print(f"\n{'=' * 60}")
+            print(f"Repository: {owner}/{repo}")
+            print("Searching for dependency files on default branch...")
 
-        # Use first branch (usually main/master)
-        default_ref = branches[0]
-        print(f"Using branch: {default_ref.name} ({default_ref.sha[:7]})")
+            scanner = RepoScanner(owner, repo, args.github_token, verbose=args.verbose)
+            branches = scanner.api.get_branches(owner, repo)
+            if not branches:
+                print("No branches found.")
+                continue
 
-        dep_files = scanner.api.find_dependency_files(owner, repo, default_ref.sha)
-        if dep_files:
-            lock_files = [f for f in dep_files if not f.endswith('package.json')]
-            package_jsons = [f for f in dep_files if f.endswith('package.json')]
+            default_ref = branches[0]
+            print(f"Using branch: {default_ref.name} ({default_ref.sha[:7]})")
 
-            print(f"\nFound {len(dep_files)} dependency file(s):")
-            if lock_files:
-                print("\n  Lock files (exact versions):")
-                for lf in sorted(lock_files):
-                    print(f"    📄 {lf}")
-            if package_jsons:
-                print("\n  package.json files (version ranges):")
-                for pj in sorted(package_jsons):
-                    print(f"    📦 {pj}")
-        else:
-            print("\n❌ No dependency files found")
-            print("   This repo may not be an npm/Node.js project.")
+            dep_files = scanner.api.find_dependency_files(owner, repo, default_ref.sha)
+            if dep_files:
+                lock_files = [f for f in dep_files if not f.endswith('package.json')]
+                package_jsons = [f for f in dep_files if f.endswith('package.json')]
+
+                print(f"\nFound {len(dep_files)} dependency file(s):")
+                if lock_files:
+                    print("\n  Lock files (exact versions):")
+                    for lf in sorted(lock_files):
+                        print(f"    📄 {lf}")
+                if package_jsons:
+                    print("\n  package.json files (version ranges):")
+                    for pj in sorted(package_jsons):
+                        print(f"    📦 {pj}")
+            else:
+                print("\n❌ No dependency files found")
+                print("   This repo may not be an npm/Node.js project.")
         sys.exit(0)
 
-    scanner.load_affected_packages(args.malicious_list_url)
+    # Load malicious packages once
+    print("Loading malicious package list...")
+    if args.malicious_list_url:
+        affected_packages = fetch_affected_packages(args.malicious_list_url)
+    else:
+        affected_packages = fetch_affected_packages()
+    print(f"Loaded {len(affected_packages)} known malicious packages\n")
 
-    results, warnings = scanner.scan_all(include_branches=include_branches, include_prs=include_prs)
+    # Track results across all repos
+    all_results: dict[str, list[ScanResult]] = {}
+    all_warnings: dict[str, list[SecurityWarning]] = {}
+    all_access_info: list[RepoAccessInfo] = []
 
-    # Output results
-    print_results(results)
+    # Scan each repository
+    for i, (owner, repo) in enumerate(repos_to_scan, 1):
+        repo_name = f"{owner}/{repo}"
 
-    # Output security warnings
-    if warnings:
-        print_security_warnings(warnings, f"{owner}/{repo}")
+        if len(repos_to_scan) > 1:
+            print(f"\n{'=' * 60}")
+            print(f"[{i}/{len(repos_to_scan)}] Scanning {repo_name}...")
+            print("-" * 50)
+        else:
+            print(f"   Repository: {repo_name}")
+            print()
 
+        scanner = RepoScanner(owner, repo, args.github_token, verbose=args.verbose)
+        scanner.affected_packages = affected_packages
+
+        # Verify access first
+        if not scanner.check_access():
+            print(f"  ❌ Cannot access repository")
+            continue
+        print()
+
+        results, warnings = scanner.scan_all(include_branches=include_branches, include_prs=include_prs,
+                                             default_branch_only=default_branch_only)
+
+        # Store results
+        if results:
+            all_results[repo_name] = results
+            print_results(results)
+        else:
+            print("\n✅ No malicious packages detected!")
+
+        if warnings:
+            all_warnings[repo_name] = warnings
+            print_security_warnings(warnings, repo_name)
+
+        # Fetch repository access information
+        if args.output:
+            try:
+                access_info = scanner.get_access_info()
+                all_access_info.append(access_info)
+            except Exception as e:
+                print(f"\n⚠️  Could not fetch access info: {e}")
+
+    # Summary for multiple repos
+    if len(repos_to_scan) > 1:
+        print("\n" + "=" * 60)
+        print("📊 SUMMARY")
+        print("=" * 60)
+
+        total_matches = sum(len(r) for r in all_results.values())
+        total_warnings = sum(len(w) for w in all_warnings.values())
+
+        if total_matches:
+            print(f"\n⚠️  Found {total_matches} malicious package match(es) across {len(all_results)} repo(s):")
+            for repo_name, results in all_results.items():
+                print(f"  • {repo_name}: {len(results)} match(es)")
+        else:
+            print("\n✅ No malicious packages detected in any repository!")
+
+        if total_warnings:
+            unpinned_count = sum(1 for ws in all_warnings.values() for w in ws if w.warning_type == 'unpinned_dependency')
+            missing_lock_count = sum(1 for ws in all_warnings.values() for w in ws if w.warning_type == 'missing_lock_file')
+            injection_count = sum(1 for ws in all_warnings.values() for w in ws if w.warning_type == 'lockfile_injection')
+            bot_count = sum(1 for ws in all_warnings.values() for w in ws if w.warning_type == 'dependency_bot')
+
+            print(f"\nSecurity warnings found:")
+            if unpinned_count:
+                print(f"  • {unpinned_count} non-pinned dependencies")
+            if missing_lock_count:
+                print(f"  • {missing_lock_count} missing lock files")
+            if injection_count:
+                print(f"  • {injection_count} suspicious lockfile entries")
+            if bot_count:
+                print(f"  • {bot_count} dependency bot configs to review")
+
+    # Export combined results
     if args.output:
-        export_json(results, warnings, args.output)
+        combined_results = []
+        combined_warnings = []
+        for repo_name, results in all_results.items():
+            combined_results.extend(results)
+        for repo_name, warnings in all_warnings.items():
+            combined_warnings.extend(warnings)
+        export_json(combined_results, combined_warnings, args.output, all_access_info if all_access_info else None)
 
     # Print general recommendations at the end
     print_security_recommendations(quiet=args.quiet)
 
     # Exit with error code if matches found
-    sys.exit(1 if results else 0)
+    total_matches = sum(len(r) for r in all_results.values())
+    sys.exit(1 if total_matches else 0)
 
 
 if __name__ == "__main__":
