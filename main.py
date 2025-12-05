@@ -1204,7 +1204,7 @@ def print_results(results: list[ScanResult]):
 
 def export_json(results: list[ScanResult], warnings: list[SecurityWarning], filepath: str,
                 access_info: Optional[list[RepoAccessInfo]] = None):
-    """Export results, warnings, and repository access information to JSON file."""
+    """Export results, warnings, and repository access information to JSON file in the output folder."""
     data = {
         "malicious_packages": [
             {
@@ -1242,9 +1242,16 @@ def export_json(results: list[ScanResult], warnings: list[SecurityWarning], file
             for info in access_info
         ]
 
-    with open(filepath, 'w') as f:
+    # Ensure output directory exists
+    output_dir = Path("output")
+    output_dir.mkdir(exist_ok=True)
+
+    # Place the file in the output directory
+    output_path = output_dir / Path(filepath).name
+
+    with open(output_path, 'w') as f:
         json.dump(data, f, indent=2)
-    print(f"\nResults exported to: {filepath}")
+    print(f"\nResults exported to: {output_path}")
 
 
 def print_security_warnings(warnings: list[SecurityWarning], repo_name: str = ""):

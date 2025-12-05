@@ -5,7 +5,9 @@ __pycache__/
 .plan
 # C extensions
 *.so
-output.json
+
+# Scanner output
+output/
 
 # Distribution / packaging
 .Python
