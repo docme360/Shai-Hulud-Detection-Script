@@ -268,9 +268,11 @@ class GitHubAPI:
             if self.verbose:
                 print(f"    [DEBUG] Fetching collaborators page {page}...")
             data = self._request(f"/repos/{owner}/{repo}/collaborators?per_page=100&page={page}")
-            if not data:
+            if not data or not isinstance(data, list):
                 break
             for user in data:
+                if not isinstance(user, dict):
+                    continue
                 collaborators.append({
                     "login": user.get("login"),
                     "type": "user",
@@ -290,14 +292,22 @@ class GitHubAPI:
             if self.verbose:
                 print(f"    [DEBUG] Fetching repo teams page {page}...")
             data = self._request(f"/repos/{owner}/{repo}/teams?per_page=100&page={page}")
-            if not data:
+            if not data or not isinstance(data, list):
                 break
             for team in data:
+                if not isinstance(team, dict):
+                    continue
+                # Extract organization login from team response
+                # The organization field contains the org that owns the team
+                org_info = team.get("organization", {})
+                org_login = org_info.get("login") if isinstance(org_info, dict) else None
+                
                 teams.append({
                     "name": team.get("name"),
                     "slug": team.get("slug"),
                     "permission": team.get("permission"),
-                    "privacy": team.get("privacy")
+                    "privacy": team.get("privacy"),
+                    "organization": org_login  # Store the organization that owns the team
                 })
             if len(data) < 100:
                 break
@@ -312,9 +322,11 @@ class GitHubAPI:
             if self.verbose:
                 print(f"    [DEBUG] Fetching team {team_slug} members page {page}...")
             data = self._request(f"/orgs/{org}/teams/{team_slug}/members?per_page=100&page={page}")
-            if not data:
+            if not data or not isinstance(data, list):
                 break
             for member in data:
+                if not isinstance(member, dict):
+                    continue
                 members.append({
                     "login": member.get("login"),
                     "type": member.get("type", "User")
@@ -583,6 +595,10 @@ def check_unpinned_dependencies(content: str, file_path: str) -> list[SecurityWa
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
+        return warnings
+
+    # package.json must be an object, not an array
+    if not isinstance(data, dict):
         return warnings
 
     dep_keys = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']
@@ -1156,7 +1172,24 @@ class RepoScanner:
         # For each team, fetch its members
         teams_with_members = []
         for team in teams_raw:
-            members = self.api.get_team_members(self.owner, team["slug"])
+            # Use the team's organization, not the repo owner
+            # The repo owner might be a user account, but teams belong to organizations
+            org = team.get("organization")
+            if not org:
+                # Fallback: if organization is missing, skip fetching members
+                # This can happen if the API response doesn't include org info
+                if self.api.verbose:
+                    print(f"    [DEBUG] Skipping team {team.get('name')}: no organization info")
+                teams_with_members.append({
+                    "name": team["name"],
+                    "slug": team["slug"],
+                    "permission": team["permission"],
+                    "privacy": team.get("privacy"),
+                    "members": []  # No members if we can't determine the org
+                })
+                continue
+            
+            members = self.api.get_team_members(org, team["slug"])
             teams_with_members.append({
                 "name": team["name"],
                 "slug": team["slug"],
