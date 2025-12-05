@@ -478,17 +478,21 @@ def parse_package_json(content: str) -> dict[str, str]:
         data = json.loads(content)
     except json.JSONDecodeError:
         return packages
-    
+
+    # Ensure data is a dict (some files may have unexpected formats)
+    if not isinstance(data, dict):
+        return packages
+
     # Check all dependency types
     dep_keys = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']
-    
+
     for key in dep_keys:
         deps = data.get(key, {})
         if isinstance(deps, dict):
             for name, version in deps.items():
                 if isinstance(version, str):
                     packages[name] = version
-    
+
     return packages
 
 
