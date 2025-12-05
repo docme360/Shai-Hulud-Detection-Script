@@ -38,7 +38,7 @@ The Shai-Hulud campaign is a supply chain attack targeting the JavaScript/Node.j
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/custom-shai-hulud.git
+git clone https://github.com/docme360/Shai-Hulud-Detection-Script.git custom-shai-hulud
 cd custom-shai-hulud
 
 # Install dependencies
