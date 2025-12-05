@@ -16,6 +16,7 @@ import subprocess
 import sys
 import urllib.request
 import urllib.error
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -250,7 +251,9 @@ class GitHubAPI:
     
     def get_file_content(self, owner: str, repo: str, path: str, ref: str) -> Optional[str]:
         """Get the content of a file at a specific ref."""
-        data = self._request(f"/repos/{owner}/{repo}/contents/{path}?ref={ref}")
+        # URL-encode the path to handle spaces and special characters
+        encoded_path = urllib.parse.quote(path, safe='/')
+        data = self._request(f"/repos/{owner}/{repo}/contents/{encoded_path}?ref={ref}")
         if data is None or isinstance(data, list):
             return None
         if data.get("encoding") == "base64":
