@@ -5,6 +5,7 @@ __pycache__/
 .plan
 # C extensions
 *.so
+output.json
 
 # Distribution / packaging
 .Python
